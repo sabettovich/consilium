@@ -4,7 +4,7 @@
 
 - Доклад‑идеи: `doc/rfc/rfc-0001-vision-community.md`
 - Журнал изменений: `doc/changelog/CHANGELOG.md`
-- Обратная связь: заводите issue или присылайте комментарии в Telegram‑группе.
+- Обратная связь: [issue №1 — Сбор отзывов по RFC‑0001](https://github.com/sabettovich/consilium/issues/1) или комментарии в Telegram‑группе.
 
 ## Как участвовать
 - Наставники: рецензирование подходов и критериев оценки.
@@ -18,3 +18,4 @@ MIT — см. файл `LICENSE`.
 
 ## Автор
 sabet — sabettovich@gmail.com
+
