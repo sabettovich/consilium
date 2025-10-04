@@ -1,0 +1,16 @@
+# Environment
+.env
+config/.env
+*.env
+.envrc
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS/Editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
