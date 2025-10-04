@@ -4,6 +4,7 @@
 
 - Доклад‑идеи: `doc/rfc/rfc-0001-vision-community.md`
 - Журнал изменений: `doc/changelog/CHANGELOG.md`
+- План работ: `doc/plan/roadmap_v1.md`
 - Обратная связь: [issue №1 — Сбор отзывов по RFC‑0001](https://github.com/sabettovich/consilium/issues/1) или комментарии в Telegram‑группе.
 
 ## Как участвовать
