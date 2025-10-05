@@ -319,3 +319,51 @@ curl -s http://localhost:8003/openapi.json | jq '.info.title, .info.version'
 - Добавить авто‑тесты (smoke на register/doc/verify/deliver с моками SMTP/Matrix).
 - Добавить админ‑страницу для просмотра БД и перезапуска verify.
 - Экспорт отчёта по делу (Markdown с перечнем DocID и дат).
+
+---
+
+## Лаба 12. Docassemble Hook (B5)
+
+- **Смысл**: принимать черновики от внешнего Docassemble и сразу регистрировать их с выдачей `DocID/permalink`.
+- **Как работает**: `POST /api/hooks/docassemble` принимает JSON с файлом (base64 или URL). При включённом `DOCASSEMBLE_HOOK_TOKEN` требует заголовок `X-Hook-Token`.
+
+### Подготовка
+
+1) В `.env`:
+```env
+DOCASSEMBLE_HOOK_TOKEN=demo-hook-token
+```
+2) Применить и перезапустить:
+```bash
+set -a; source ./.env; set +a
+uvicorn app.main:app --port 8003 --reload
+```
+
+### Вариант A: base64
+```bash
+B64=$(printf "Hello from Docassemble hook\n" | base64 -w0)
+curl -s -X POST http://localhost:8003/api/hooks/docassemble \
+  -H 'Content-Type: application/json' \
+  -H 'X-Hook-Token: demo-hook-token' \
+  -d "$(jq -n --arg m '2023-AR-0001' --arg t 'hook_demo.txt' --arg b "$B64" \
+        '{matter_id:$m,title:$t,file_base64:$b, class_:"generated", origin_meta:{source:"lab12"}}')" | jq .
+```
+- **Ожидаемо**: 201 и JSON `{ doc_id, permalink, storage_ref, sha256 }`.
+
+### Вариант B: URL
+```bash
+curl -s -X POST http://localhost:8003/api/hooks/docassemble \
+  -H 'Content-Type: application/json' \
+  -H 'X-Hook-Token: demo-hook-token' \
+  -d '{"matter_id":"2023-AR-0001","title":"hook_via_url.pdf","file_url":"https://example.com/sample.pdf"}' | jq .
+```
+
+### Проверка
+```bash
+DOC_ID=<из ответа>
+curl -s "http://localhost:8003/api/docs/${DOC_ID}" -H "X-Client-Token: ${CLIENT_READ_TOKEN}" | jq '.doc_id,.title,.origin'
+curl -i "http://localhost:8003/doc/${DOC_ID}" -H "X-Client-Token: ${CLIENT_READ_TOKEN}" | sed -n '1,5p'
+```
+- **Ожидаемо**: `origin = "docassemble"`, редирект 3xx на Google Drive.
+
+> Примечание: если `DOCASSEMBLE_HOOK_TOKEN` не задан, заголовок не требуется (использовать только в защищённой среде).

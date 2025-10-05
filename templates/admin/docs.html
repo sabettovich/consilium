@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Consilium — Admin Docs</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif; margin: 24px; }
+    h1 { margin-bottom: 12px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }
+    th { background: #f5f5f5; text-align: left; }
+    tr:nth-child(even) { background: #fafafa; }
+    .btn { display: inline-block; padding: 6px 10px; font-size: 13px; border-radius: 4px; text-decoration: none; border: 1px solid #888; background: #fff; color: #333; }
+    .btn:hover { background: #f0f0f0; }
+    .nowrap { white-space: nowrap; }
+    .muted { color: #777; }
+    .banner { margin: 12px 0; padding: 10px 12px; border: 1px solid #9ac; background: #eef6ff; color: #034; border-radius: 6px; }
+    .actions form { display: inline; margin-right: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Документы</h1>
+  {% if msg %}
+  <div class="banner">{{ msg }}</div>
+  {% endif %}
+  <table>
+    <thead>
+      <tr>
+        <th>DocID</th>
+        <th>Matter</th>
+        <th>Title</th>
+        <th>Status</th>
+        <th>SHA256</th>
+        <th>Updated</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for d in docs %}
+      <tr>
+        <td class="nowrap">{{ d.doc_id }}</td>
+        <td class="nowrap">{{ d.matter_id }}</td>
+        <td>{{ d.title }}</td>
+        <td class="nowrap">{{ d.status }}</td>
+        <td class="muted" style="max-width:340px; overflow:hidden; text-overflow:ellipsis;">{{ d.sha256_plain }}</td>
+        <td class="nowrap">{{ d.updated_at }}</td>
+        <td class="actions">
+          <form method="post" action="/admin/docs/{{ d.doc_id }}/verify">
+            <button class="btn" type="submit">Verify</button>
+          </form>
+          <form method="post" action="/admin/docs/{{ d.doc_id }}/sync_sha">
+            <button class="btn" type="submit">Sync SHA</button>
+          </form>
+          <a class="btn" href="/api/docs/{{ d.doc_id }}" target="_blank">JSON</a>
+          <a class="btn" href="/doc/{{ d.doc_id }}" target="_blank">Open</a>
+        </td>
+      </tr>
+    {% else %}
+      <tr>
+        <td colspan="7" class="muted">Нет документов</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>

@@ -47,3 +47,6 @@ EMBED_ON_DELIVER = os.getenv('EMBED_ON_DELIVER', 'false').lower() == 'true'
 
 # Client read token (B3)
 CLIENT_READ_TOKEN = os.getenv('CLIENT_READ_TOKEN', '')
+
+# Docassemble hook token (B5)
+DOCASSEMBLE_HOOK_TOKEN = os.getenv('DOCASSEMBLE_HOOK_TOKEN', '')

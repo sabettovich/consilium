@@ -13,20 +13,19 @@
 ## Чек-лист статуса
 - [x] B1.1: Спецификация формата отчёта (JSONL + агрегат)
 - [x] B1.2: Планировщик (периодический воркер)
-- [x] B1.3: Batch‑verify исполнитель
 - [x] B1.4: Хранение результатов (logs/reports_integrity.jsonl)
 - [x] B1.5: Эндпойнт GET /api/reports/integrity
 - [x] B1.6: Документация и команды проверки
 - [x] B2: Вшивка DocID в PDF/DOCX (утилита и гайд)
 - [x] B3: Мини‑ACL (client‑token)
-- [ ] B4: Admin‑вью
-- [ ] B5: Docassemble вебхуки
+- [x] B4: Admin‑вью
+- [x] B5: Docassemble вебхуки
 
 ---
 
 ## B1. Отчёт целостности (SHA256)
 
-- **B1.1 Спецификация формата**
+{{ ... }}
   - Отчёт в `logs/reports_integrity.jsonl` (JSON Lines), запись на каждый запуск:
     ```json
     {"ts":"ISO","doc_id":"...","matter_id":"...","status":"registered|delivered|archived","result":{"match":true,"sha256_current":"...","sha256_stored":"..."}}

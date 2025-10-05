@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -10,6 +11,9 @@ import json
 from datetime import datetime
 import asyncio
 from typing import Optional, Dict, List
+import base64
+import mimetypes
+import requests
 import subprocess
 import sys
 
@@ -37,6 +41,7 @@ from .config import (
     EMBED_OUT_FOLDER,
     EMBED_ON_DELIVER,
     CLIENT_READ_TOKEN,
+    DOCASSEMBLE_HOOK_TOKEN,
 )
 from . import drive as gdrive
 from .notifier_email import send_email
@@ -44,9 +49,30 @@ from .notifier_matrix import send_matrix_message
 
 
 app = FastAPI(title="Consilium Resolver", version="0.1.0")
+templates = Jinja2Templates(directory="templates")
 
 # Auto-migrate (create tables)
 Base.metadata.create_all(bind=engine)
+
+# --- Pydantic models (used in endpoints) ---
+class PatchDoc(BaseModel):
+    title: str | None = None
+    storage: str | None = None
+    storage_ref: str | None = None
+    status: str | None = None
+    tags: dict | list | None = None
+    owner: str | None = None
+    origin: str | None = None
+    origin_meta: dict | list | None = None
+
+
+class DocassembleHook(BaseModel):
+    matter_id: str
+    title: str
+    class_: str | None = None
+    file_base64: str | None = None  # base64-encoded file content
+    file_url: str | None = None     # alternatively, URL to download
+    origin_meta: dict | list | None = None
 
 # --- Lightweight migrations for SQLite (idempotent) ---
 def _add_column_if_missing(table: str, column: str, decl: str) -> None:
@@ -303,17 +329,6 @@ def notify(event: str, payload: dict) -> None:
         pass
 
 
-class PatchDoc(BaseModel):
-    title: str | None = None
-    storage: str | None = None
-    storage_ref: str | None = None
-    status: str | None = None
-    tags: dict | list | None = None
-    owner: str | None = None
-    origin: str | None = None
-    origin_meta: dict | list | None = None
-
-
 @app.post("/api/docs/register")
 async def register_document(
     matter_id: str = Form(...),
@@ -405,6 +420,116 @@ async def register_document(
             pass
 
 
+@app.post("/api/hooks/docassemble")
+def hook_docassemble(payload: DocassembleHook, request: Request):
+    # Token guard
+    if DOCASSEMBLE_HOOK_TOKEN:
+        token = request.headers.get("X-Hook-Token", "")
+        if token != DOCASSEMBLE_HOOK_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid hook token")
+
+    # Validate input
+    if not payload.matter_id or not payload.title:
+        raise HTTPException(status_code=400, detail="matter_id and title are required")
+    if not (payload.file_base64 or payload.file_url):
+        raise HTTPException(status_code=400, detail="file_base64 or file_url required")
+
+    temp_path = None
+    try:
+        # Prepare temp file
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            temp_path = tf.name
+            if payload.file_base64:
+                try:
+                    data = base64.b64decode(payload.file_base64, validate=True)
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid base64")
+                if len(data) > 25 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="File too large")
+                tf.write(data)
+            else:
+                try:
+                    r = requests.get(payload.file_url, timeout=20)
+                    r.raise_for_status()
+                    data = r.content
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to download: {e}")
+                if len(data) > 25 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="File too large")
+                tf.write(data)
+
+        # Compute hash and upload like register_document
+        sha256 = compute_sha256(temp_path)
+        doc_id = generate_doc_id()
+
+        with SessionLocal() as db:
+            intake_folder_id = ensure_matter_structure(db, payload.matter_id)
+
+        # Guess extension from title or content
+        title = payload.title
+        _, ext = os.path.splitext(title)
+        if not ext:
+            # try mimetype by sniffing
+            mime = mimetypes.guess_type(title)[0]
+            if mime:
+                ext = mimetypes.guess_extension(mime) or ""
+        safe_name = f"{doc_id}__{title}"
+        target_name = f"{safe_name}{ext}" if ext else safe_name
+
+        uploaded = gdrive.upload_file(intake_folder_id, temp_path, target_name)
+        storage_ref = uploaded.get("id")
+        web_link = uploaded.get("webViewLink")
+
+        permalink = build_permalink(doc_id)
+
+        # Save DB record
+        with SessionLocal() as db:
+            db_doc = Doc(
+                doc_id=doc_id,
+                matter_id=payload.matter_id,
+                class_name=(payload.class_ or "generated"),
+                title=title,
+                sha256_plain=sha256,
+                storage="gdrive",
+                storage_ref=storage_ref,
+                origin="docassemble",
+                origin_meta=payload.origin_meta,
+                owner=None,
+                status="registered",
+                tags=None,
+            )
+            db.add(db_doc)
+            db.commit()
+
+        # notify
+        notify(
+            "doc_registered",
+            {
+                "matter_id": payload.matter_id,
+                "class": payload.class_ or "generated",
+                "title": title,
+                "doc_id": doc_id,
+                "permalink": permalink,
+            },
+        )
+
+        return JSONResponse(
+            status_code=201,
+            content={
+                "doc_id": doc_id,
+                "permalink": permalink,
+                "sha256": sha256,
+                "storage": "gdrive",
+                "storage_ref": storage_ref,
+                "webViewLink": web_link,
+            },
+        )
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 @app.get("/doc/{doc_id}")
 def resolve_doc(doc_id: str, request: Request):
     with SessionLocal() as db:
@@ -627,3 +752,53 @@ def sync_doc_sha(doc_id: str):
             return {"doc_id": doc_id, "sha256_previous": prev, "sha256_updated": current, "changed": changed}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# --- B4: Admin view ---
+@app.get("/admin/docs")
+def admin_docs(request: Request, limit: int = 200):
+    with SessionLocal() as db:
+        # простая выборка последних обновлённых
+        rows = db.execute(select(Doc)).scalars().all()
+    # сортируем по updated_at desc на стороне приложения для простоты
+    try:
+        rows = sorted(rows, key=lambda r: (r.updated_at or datetime.min), reverse=True)  # type: ignore
+    except Exception:
+        pass
+    return templates.TemplateResponse(
+        "admin/docs.html",
+        {
+            "request": request,
+            "docs": rows[:limit],
+            "msg": request.query_params.get("msg", ""),
+        },
+    )
+
+
+@app.post("/admin/docs/{doc_id}/verify")
+def admin_docs_verify(doc_id: str):
+    # выполнить проверку и показать результат в баннере
+    msg = ""
+    try:
+        res = verify_doc(doc_id)
+        ok = res.get("match")
+        msg = f"Verify {doc_id}: match={ok}"
+    except Exception as e:
+        msg = f"Verify {doc_id}: error: {e}"
+    return RedirectResponse(url=f"/admin/docs?msg={msg}", status_code=303)
+
+
+@app.post("/admin/docs/{doc_id}/sync_sha")
+def admin_docs_sync_sha(doc_id: str):
+    msg = ""
+    try:
+        res = sync_doc_sha(doc_id)
+        if isinstance(res, JSONResponse):
+            # unwrap JSONResponse content for message
+            msg = f"Sync {doc_id}: status={res.status_code}"
+        else:
+            changed = res.get("changed")
+            msg = f"Sync {doc_id}: changed={changed}"
+    except Exception as e:
+        msg = f"Sync {doc_id}: error: {e}"
+    return RedirectResponse(url=f"/admin/docs?msg={msg}", status_code=303)
