@@ -225,6 +225,55 @@ curl -s http://localhost:8003/openapi.json | jq '.info.title, .info.version'
 
 ---
 
+## Лаба 9.1. OCR сканов и PDF
+
+- **Смысл**: распознавать текст в текстовых и сканированных PDF, получать извлечённый текст через API.
+- **Как работает**:
+  - `mode=auto` сам выбирает инструмент:
+    - текстовый PDF → `pdftotext`.
+    - скан PDF → `pdftoppm`/`pdftocairo` → `tesseract` (языки из `OCR_LANGS`).
+  - Авто‑фолбэк: если `pdftotext` вернул пустоту/управляющие символы — переход на `tesseract`.
+  - Ограничение по страницам: `OCR_MAX_PAGES` (по умолчанию 35).
+  - Предобработка изображений (если установлен ImageMagick `convert`): `grayscale + normalize + contrast-stretch + sharpen` перед tesseract.
+
+### Параметры `.env`
+```env
+OCR_LANGS=rus+eng
+OCR_DPI=300
+OCR_MAX_PAGES=35
+DEBUG_OCR=false
+```
+
+### Эндпоинты
+- Поставить документ в очередь OCR:
+  ```bash
+  export DOC_ID="D-..."
+  curl -s -X POST http://localhost:8003/api/ocr/enqueue -F doc_id="$DOC_ID" | jq .
+  sleep 20
+  curl -s "http://localhost:8003/api/docs/$DOC_ID" | jq '.origin_meta.ocr_info'
+  curl -s "http://localhost:8003/api/docs/$DOC_ID/text" | jq '{text: (.text[0:800])}'
+  ```
+- Форсировать скан‑режим:
+  ```bash
+  curl -s -X POST http://localhost:8003/api/ocr/enqueue -F doc_id="$DOC_ID" -F mode=image | jq .
+  ```
+- Admin re‑OCR (один/батч):
+  ```bash
+  curl -s -X POST "http://localhost:8003/api/admin/ocr/requeue?doc_id=$DOC_ID&mode=auto" | jq .
+  curl -s -X POST "http://localhost:8003/api/admin/ocr/requeue_batch?matter_id=2023-AR-0001&mode=auto" | jq .
+  ```
+- Дубликаты `doc_id`:
+  ```bash
+  curl -s http://localhost:8003/api/admin/docs/duplicates | jq .
+  ```
+
+### Траблшутинг больших сканов
+- Если `pdftoppm` висит/падает → в логе будет `[ocr] pdftoppm: code=...`; включён фолбэк `pdftocairo` и увеличенный таймаут.
+- Если `tesseract` молчит → проверьте `tesseract --list-langs` (должны быть `eng` и `rus`).
+- Для «тяжёлых» сканов установите ImageMagick (`convert`) и оставьте `DEBUG_OCR=true` временно для диагностики.
+
+---
+
 ## Контрольный чек‑лист прохождения
 
 - **[x]** Сервис запущен, API отвечает.

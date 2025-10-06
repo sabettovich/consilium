@@ -1,3 +1,10 @@
+def _ensure_unique_docid_index() -> None:
+    """Create UNIQUE index on docs.doc_id if missing (SQLite)."""
+    with engine.connect() as conn:
+        # Create unique index if not exists
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uidx_docs_doc_id ON docs(doc_id)"))
+        conn.commit()
+
 # Helpers
 def _is_audio(filename: str | None, content_type: str | None) -> bool:
     ctype = (content_type or "").lower()
@@ -29,7 +36,7 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, update
 from pathlib import Path
 import tempfile
 import os
@@ -42,6 +49,8 @@ import mimetypes
 import requests
 import subprocess
 import sys
+from sqlalchemy import text
+import shutil
 
 from .db import Base, engine, SessionLocal
 from .models import Doc, Matter
@@ -68,6 +77,10 @@ from .config import (
     EMBED_ON_DELIVER,
     CLIENT_READ_TOKEN,
     DOCASSEMBLE_HOOK_TOKEN,
+    OCR_LANGS,
+    OCR_DPI,
+    OCR_MAX_PAGES,
+    DEBUG_OCR,
 )
 from . import drive as gdrive
 from .notifier_email import send_email
@@ -108,6 +121,26 @@ def _add_column_if_missing(table: str, column: str, decl: str) -> None:
         cols = {row[1] for row in info}
         if column not in cols:
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+
+# --- C2.1: Lightweight Jobs table (for OCR queue) ---
+def _init_jobs_table() -> None:
+    with engine.connect() as conn:
+        conn.execute(text(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                payload JSON,
+                status TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        ))
+        conn.commit()
+
+_init_jobs_table()
 
 # Add new columns for matters
 _add_column_if_missing("matters", "client_name", "TEXT")
@@ -187,10 +220,157 @@ async def _integrity_worker():
         await asyncio.sleep(interval)
 
 
+# --- C2.1: OCR worker (skeleton) ---
+def _enqueue_job(job_type: str, payload: dict) -> int:
+    now = datetime.utcnow().isoformat() + "Z"
+    with engine.connect() as conn:
+        res = conn.execute(
+            text("INSERT INTO jobs (type, payload, status, attempts, created_at, updated_at) VALUES (:t, :p, 'pending', 0, :c, :u)"),
+            {"t": job_type, "p": json.dumps(payload, ensure_ascii=False), "c": now, "u": now},
+        )
+        conn.commit()
+        return res.lastrowid if hasattr(res, "lastrowid") else 0
+
+
+def _take_next_job(job_type: str) -> dict | None:
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, payload, attempts FROM jobs WHERE type=:t AND status='pending' ORDER BY id ASC LIMIT 1"),
+            {"t": job_type},
+        ).fetchone()
+        if not row:
+            return None
+        jid = row[0]
+        attempts = int(row[2] or 0)
+        conn.execute(
+            text("UPDATE jobs SET status='processing', attempts=:a, updated_at=:u WHERE id=:id"),
+            {"a": attempts + 1, "u": datetime.utcnow().isoformat() + "Z", "id": jid},
+        )
+        conn.commit()
+        try:
+            payload = json.loads(row[1] or "{}")
+        except Exception:
+            payload = {}
+        return {"id": jid, "payload": payload}
+
+
+def _finish_job(job_id: int, status: str) -> None:
+    with engine.connect() as conn:
+        conn.execute(
+            text("UPDATE jobs SET status=:s, updated_at=:u WHERE id=:id"),
+            {"s": status, "u": datetime.utcnow().isoformat() + "Z", "id": job_id},
+        )
+        conn.commit()
+
+
+async def _ocr_worker():
+    while True:
+        try:
+            job = _take_next_job("ocr")
+            if not job:
+                await asyncio.sleep(2)
+                continue
+            jid = int(job["id"])
+            payload = job.get("payload") or {}
+            doc_id = payload.get("doc_id")
+            mode = (payload.get("mode") or "auto").lower()
+            try:
+                print(f"[ocr] start jid={jid} payload={payload}")
+            except Exception:
+                pass
+            if not doc_id:
+                _finish_job(jid, "failed")
+                continue
+            # Real OCR: скачать файл из Drive, распознать, сохранить текст в origin_meta.ocr_text
+            with SessionLocal() as db:
+                row = db.execute(select(Doc).where(Doc.doc_id == doc_id)).scalar_one_or_none()
+                if not row or not row.storage_ref:
+                    _finish_job(jid, "failed")
+                    continue
+                # 1) Скачиваем содержимое
+                try:
+                    content = gdrive.download_file_content(row.storage_ref)
+                except Exception:
+                    _finish_job(jid, "failed")
+                    continue
+                # 2) Определяем тип по имени
+                try:
+                    nm = gdrive.get_file_name_mime(row.storage_ref).get("name", "")
+                except Exception:
+                    nm = row.title or "document"
+                text_out, ocr_info = _run_ocr_pipeline(content, nm, mode)
+                # 3) Тримминг длинных
+                truncated = False
+                max_len = 2 * 1024 * 1024  # 2MB
+                if isinstance(text_out, bytes):
+                    try:
+                        text_out = text_out.decode("utf-8", errors="replace")
+                    except Exception:
+                        text_out = ""
+                if len(text_out) > max_len:
+                    text_out = text_out[:max_len] + "\n[truncated]"
+                    truncated = True
+                # 4) Сохраняем в origin_meta и теги
+                meta = row.origin_meta or {}
+                if isinstance(meta, list):
+                    meta = {"note": "; ".join(str(x) for x in meta)}
+                meta["ocr_text"] = text_out
+                meta["ocr_info"] = {
+                    "tool": ocr_info.get("tool"),
+                    "code": ocr_info.get("code"),
+                    "error": ocr_info.get("error"),
+                    "truncated": truncated,
+                    "mode": (ocr_info.get("mode") or mode),
+                }
+                if DEBUG_OCR:
+                    try:
+                        print(f"[ocr] save doc_id={doc_id} tool={meta['ocr_info']['tool']} mode={meta['ocr_info'].get('mode')} text_len={len(text_out)}")
+                    except Exception:
+                        pass
+                row.origin_meta = meta
+                tags = row.tags or []
+                if isinstance(tags, dict):
+                    tags = [f"k:{k}={v}" for k, v in tags.items()]
+                tags = [t for t in tags if t != "ocr:queued"]
+                if ocr_info.get("ok"):
+                    if "ocr:done" not in tags:
+                        tags.append("ocr:done")
+                else:
+                    if "ocr:failed" not in tags:
+                        tags.append("ocr:failed")
+                row.tags = tags
+                row.updated_at = datetime.utcnow()
+                db.add(row)
+                # Also update any other rows with same doc_id (in case of duplicates)
+                try:
+                    db.execute(
+                        update(Doc)
+                        .where(Doc.doc_id == doc_id)
+                        .values(origin_meta=meta, tags=tags, updated_at=datetime.utcnow())
+                    )
+                except Exception:
+                    pass
+                db.commit()
+                _finish_job(jid, "done" if ocr_info.get("ok") else "failed")
+        except Exception:
+            # не роняем цикл воркера
+            await asyncio.sleep(2)
+
+
 @app.on_event("startup")
 async def _startup_tasks():
     # fire-and-forget background task
     asyncio.create_task(_integrity_worker())
+    asyncio.create_task(_ocr_worker())
+    # ensure DB structures
+    try:
+        _init_jobs_table()
+    except Exception:
+        pass
+    try:
+        _ensure_unique_docid_index()
+    except Exception:
+        pass
 
 
 @app.get("/api/reports/integrity")
@@ -628,6 +808,217 @@ def get_doc(doc_id: str, request: Request):
         }
 
 
+# --- C2.1: enqueue OCR job for a document ---
+@app.post("/api/ocr/enqueue")
+def ocr_enqueue(doc_id: str = Form(...), mode: str = Form("auto")):
+    with SessionLocal() as db:
+        row = db.execute(select(Doc).where(Doc.doc_id == doc_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Doc not found")
+        # add tag marker and enqueue job
+        tags = row.tags or []
+        if isinstance(tags, dict):
+            tags = [f"k:{k}={v}" for k, v in tags.items()]
+        if "ocr:queued" not in tags:
+            tags.append("ocr:queued")
+        row.tags = tags
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+    mode = (mode or "auto").lower()
+    if mode not in ("auto", "image", "pdf"):
+        mode = "auto"
+    jid = _enqueue_job("ocr", {"doc_id": doc_id, "mode": mode})
+    return {"ok": True, "job_id": jid}
+
+
+# --- C2.2: OCR helpers ---
+def _run_cmd(cmd: list[str], input_bytes: bytes | None = None, timeout_sec: int = 120) -> tuple[int, bytes, bytes]:
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input_bytes is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = p.communicate(input=input_bytes, timeout=timeout_sec)
+        return p.returncode, out or b"", err or b""
+    except Exception as e:
+        return 1, b"", str(e).encode()
+
+
+def _run_ocr_pipeline(content: bytes, name: str, mode: str = "auto") -> tuple[str, dict]:
+    name_lower = (name or "").lower()
+    is_pdf = name_lower.endswith(".pdf") or (content[:4] == b"%PDF")
+    if DEBUG_OCR:
+        try:
+            print(f"[ocr] detect: name={name_lower} is_pdf={is_pdf} mode={mode}")
+        except Exception:
+            pass
+    # Try pdftotext for PDFs; if looks empty, fallback to tesseract per page
+    if is_pdf:
+        with tempfile.TemporaryDirectory() as td:
+            pdf_path = Path(td) / "input.pdf"
+            with open(pdf_path, "wb") as f:
+                f.write(content)
+            # If forced image mode, skip pdftotext and go straight to tesseract
+            if mode == "image":
+                if DEBUG_OCR:
+                    try:
+                        print("[ocr] pipeline: mode=image -> skip pdftotext, using pdftoppm+tesseract")
+                    except Exception:
+                        pass
+            elif shutil.which("pdftotext"):
+                code, out, err = _run_cmd(["pdftotext", "-layout", str(pdf_path), "-"])
+                text_pt = out.decode("utf-8", errors="replace") if out else ""
+                # Heuristic: treat as empty if only whitespace/control OR no letters
+                import re
+                compact = re.sub(r"[\s\f\n\r]+", "", text_pt)
+                has_letters = re.search(r"[A-Za-zА-Яа-я]", text_pt) is not None
+                # additionally require letters within first 1000 chars
+                head = text_pt[:1000]
+                head_has_letters = re.search(r"[A-Za-zА-Яа-я]", head) is not None
+                if code == 0 and len(compact) > 0 and has_letters and head_has_letters:
+                    info = {"ok": True, "tool": "pdftotext", "code": code, "error": "", "mode": mode}
+                    return text_pt, info
+            # Fallback to images + tesseract if available
+            if shutil.which("pdftoppm") and shutil.which("tesseract"):
+                # Convert first N pages to PNG and OCR per page
+                N = int(OCR_MAX_PAGES) if OCR_MAX_PAGES else 20
+                # pdftoppm -r 300 -png input.pdf out
+                code_ppm, _, err_ppm = _run_cmd([
+                    "pdftoppm", "-r", str(int(OCR_DPI)), "-png",
+                    "-f", "1", "-l", str(N),
+                    str(pdf_path), str(Path(td)/"page")
+                ], timeout_sec=600)
+                if DEBUG_OCR:
+                    try:
+                        print(f"[ocr] pdftoppm: code={code_ppm} err={(err_ppm or b'').decode(errors='replace')[:200]}")
+                    except Exception:
+                        pass
+                # Fallback to pdftocairo if pdftoppm failed
+                if code_ppm != 0 and shutil.which("pdftocairo"):
+                    code_ppm, _, err_ppm = _run_cmd([
+                        "pdftocairo", "-png", "-r", str(int(OCR_DPI)),
+                        str(pdf_path), str(Path(td)/"page"), "-f", "1", "-l", str(N)
+                    ], timeout_sec=600)
+                    if DEBUG_OCR:
+                        try:
+                            print(f"[ocr] pdftocairo: code={code_ppm} err={(err_ppm or b'').decode(errors='replace')[:200]}")
+                        except Exception:
+                            pass
+
+                if code_ppm == 0:
+                    pages = sorted(Path(td).glob("page-*.png"))[:N]
+                    if DEBUG_OCR:
+                        try:
+                            print(f"[ocr] pages generated: {len(pages)} (cap={N})")
+                        except Exception:
+                            pass
+                    texts: list[str] = []
+                    for p in pages:
+                        # Optional pre-processing with ImageMagick, if available
+                        preprocessed = None
+                        if shutil.which("convert"):
+                            try:
+                                preprocessed = p.with_name(p.stem + "-prep.png")
+                                # Conservative pipeline: grayscale + normalize + slight sharpen
+                                # Avoid aggressive thresholding to not lose fine glyphs
+                                cmd_conv = [
+                                    "convert", str(p),
+                                    "-colorspace", "Gray",
+                                    "-normalize",
+                                    "-contrast-stretch", "0.5%x0.5%",
+                                    "-sharpen", "0x1",
+                                    str(preprocessed),
+                                ]
+                                cprep, _, eprep = _run_cmd(cmd_conv, timeout_sec=120)
+                                if DEBUG_OCR:
+                                    try:
+                                        print(f"[ocr] preprocess convert page={p.name} code={cprep} err={(eprep or b'').decode(errors='replace')[:120]}")
+                                    except Exception:
+                                        pass
+                                if cprep != 0:
+                                    preprocessed = None
+                            except Exception:
+                                preprocessed = None
+
+                        img_for_ocr = str(preprocessed or p)
+                        c, o, e = _run_cmd(["tesseract", img_for_ocr, "-", "-l", OCR_LANGS, "--oem", "1", "--psm", "6"], timeout_sec=180)
+                        if DEBUG_OCR and c != 0:
+                            try:
+                                print(f"[ocr] tesseract page={p.name} code={c} err={(e or b'').decode(errors='replace')[:200]}")
+                            except Exception:
+                                pass
+                        if c == 0 and o:
+                            texts.append(o.decode("utf-8", errors="replace"))
+                        else:
+                            # keep going; collect errors optionally
+                            pass
+                    txt = "\n\f\n".join(texts)
+                    ok = len(txt.strip()) > 0
+                    if DEBUG_OCR:
+                        try:
+                            print(f"[ocr] pipeline: using image fallback, pages={len(pages)}, ok={ok}")
+                        except Exception:
+                            pass
+                    info = {"ok": ok, "tool": "pdftoppm+tesseract", "code": 0 if ok else 1, "error": (err_ppm.decode(errors="replace") if not ok else ""), "mode": mode}
+                    return txt, info
+            # If no fallback tools or still empty
+            info = {"ok": False, "tool": "pdftotext" if mode != "image" else "pdftoppm+tesseract", "code": 1, "error": "empty_output", "mode": mode}
+            return "", info
+    # Try tesseract for images
+    if shutil.which("tesseract") and (name_lower.endswith(".png") or name_lower.endswith(".jpg") or name_lower.endswith(".jpeg")):
+        with tempfile.TemporaryDirectory() as td:
+            img_path = Path(td) / ("input" + (Path(name_lower).suffix or ".png"))
+            with open(img_path, "wb") as f:
+                f.write(content)
+            code, out, err = _run_cmd(["tesseract", str(img_path), "-", "-l", OCR_LANGS])
+            ok = code == 0 and len(out) > 0
+            info = {"ok": ok, "tool": "tesseract", "code": code, "error": (err.decode(errors="replace") if code != 0 else ""), "mode": mode}
+            return (out.decode("utf-8", errors="replace") if ok else ""), info
+    # Fallback: no tool
+    return "", {"ok": False, "tool": "none", "code": 127, "error": "No suitable OCR tool available", "mode": mode}
+
+
+# --- C2.2: Read OCR text ---
+@app.get("/api/docs/{doc_id}/text")
+def get_doc_text(doc_id: str, request: Request):
+    with SessionLocal() as db:
+        row = db.execute(select(Doc).where(Doc.doc_id == doc_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Doc not found")
+        _enforce_client_token(request, row)
+        meta = row.origin_meta or {}
+        text_val = ""
+        truncated = False
+        if isinstance(meta, dict):
+            text_val = meta.get("ocr_text") or ""
+            info = meta.get("ocr_info") or {}
+            truncated = bool(info.get("truncated")) if isinstance(info, dict) else False
+        return {"doc_id": row.doc_id, "text": text_val, "truncated": truncated}
+
+
+# --- DEBUG: expose DB path and raw origin_meta ---
+@app.get("/api/debug/db_path")
+def debug_db_path():
+    if not DEBUG_OCR:
+        raise HTTPException(status_code=404, detail="Not Found")
+    from .config import DB_PATH
+    return {"db_path": DB_PATH}
+
+
+@app.get("/api/debug/doc/{doc_id}/raw")
+def debug_doc_raw(doc_id: str):
+    if not DEBUG_OCR:
+        raise HTTPException(status_code=404, detail="Not Found")
+    with SessionLocal() as db:
+        row = db.execute(select(Doc).where(Doc.doc_id == doc_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Doc not found")
+        return {
+            "doc_id": row.doc_id,
+            "origin_meta": row.origin_meta,
+            "tags": row.tags,
+            "updated_at": str(row.updated_at),
+        }
+
+
 @app.post("/api/docs/{doc_id}/deliver")
 def deliver_doc(doc_id: str, message: str | None = Form(default=None)):
     with SessionLocal() as db:
@@ -845,6 +1236,51 @@ def admin_docs(
             "has_prev": has_prev,
         },
     )
+
+
+# --- Admin: list duplicate doc_ids
+@app.get("/api/admin/docs/duplicates")
+def admin_list_doc_duplicates():
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            """
+            SELECT doc_id, COUNT(*) as cnt
+            FROM docs
+            GROUP BY doc_id
+            HAVING cnt > 1
+            ORDER BY cnt DESC
+            """
+        )).fetchall()
+        return {"duplicates": [{"doc_id": r[0], "count": r[1]} for r in rows]}
+
+
+# --- Admin: re-OCR endpoints
+@app.post("/api/admin/ocr/requeue")
+def admin_requeue_ocr(doc_id: str, mode: str = "auto"):
+    mode = (mode or "auto").lower()
+    if mode not in ("auto", "image", "pdf"):
+        mode = "auto"
+    # ensure doc exists
+    with SessionLocal() as db:
+        row = db.execute(select(Doc).where(Doc.doc_id == doc_id)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Doc not found")
+    jid = _enqueue_job("ocr", {"doc_id": doc_id, "mode": mode})
+    return {"ok": True, "job_id": jid}
+
+
+@app.post("/api/admin/ocr/requeue_batch")
+def admin_requeue_ocr_batch(matter_id: str, mode: str = "auto"):
+    mode = (mode or "auto").lower()
+    if mode not in ("auto", "image", "pdf"):
+        mode = "auto"
+    count = 0
+    with SessionLocal() as db:
+        rows = db.execute(select(Doc.doc_id).where(Doc.matter_id == matter_id)).scalars().all()
+        for did in rows:
+            _enqueue_job("ocr", {"doc_id": did, "mode": mode})
+            count += 1
+    return {"ok": True, "enqueued": count, "mode": mode}
 
 
 @app.post("/admin/docs/{doc_id}/verify")

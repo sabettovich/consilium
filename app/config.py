@@ -50,3 +50,15 @@ CLIENT_READ_TOKEN = os.getenv('CLIENT_READ_TOKEN', '')
 
 # Docassemble hook token (B5)
 DOCASSEMBLE_HOOK_TOKEN = os.getenv('DOCASSEMBLE_HOOK_TOKEN', '')
+
+# OCR configuration
+OCR_LANGS = os.getenv('OCR_LANGS', 'rus+eng')  # languages for tesseract
+try:
+    OCR_DPI = int(os.getenv('OCR_DPI', '300'))  # dpi for pdftoppm
+except Exception:
+    OCR_DPI = 300
+try:
+    OCR_MAX_PAGES = int(os.getenv('OCR_MAX_PAGES', '20'))  # page cap for OCR
+except Exception:
+    OCR_MAX_PAGES = 20
+DEBUG_OCR = os.getenv('DEBUG_OCR', 'false').lower() in ('1', 'true', 'yes')
