@@ -1,9 +1,35 @@
+# Helpers
+def _is_audio(filename: str | None, content_type: str | None) -> bool:
+    ctype = (content_type or "").lower()
+    if ctype.startswith("audio/"):
+        return True
+    if filename:
+        _, ext = os.path.splitext(filename)
+        if ext.lower() in {".wav", ".mp3"}:
+            return True
+    return False
+
+# Upload constraints (C1.2)
+UPLOAD_MAX_BYTES_DEFAULT = 25 * 1024 * 1024  # 25 MB
+UPLOAD_MAX_BYTES_AUDIO = 100 * 1024 * 1024   # 100 MB for audio evidence
+ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "text/plain",
+    "image/png",
+    "image/jpeg",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/mpeg",  # mp3
+}
+ALLOWED_EXTS = {".pdf", ".docx", ".txt", ".png", ".jpg", ".jpeg", ".wav", ".mp3"}
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, desc
 from pathlib import Path
 import tempfile
 import os
@@ -344,13 +370,30 @@ async def register_document(
     # Save upload to temp file to hash
     with tempfile.NamedTemporaryFile(delete=False) as tf:
         temp_path = tf.name
+        total = 0
+        max_bytes = UPLOAD_MAX_BYTES_AUDIO if _is_audio(file.filename, file.content_type) else UPLOAD_MAX_BYTES_DEFAULT
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
             tf.write(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                return JSONResponse(status_code=413, content={"error": "File too large"})
     try:
         try:
+            # MIME and extension validation (best-effort)
+            ctype = (file.content_type or "").lower()
+            _, req_ext = os.path.splitext(file.filename or "")
+            req_ext = req_ext.lower()
+            if ctype and ctype not in ALLOWED_CONTENT_TYPES:
+                return JSONResponse(status_code=415, content={"error": f"Unsupported content type: {ctype}"})
+            if req_ext and req_ext not in ALLOWED_EXTS:
+                return JSONResponse(status_code=415, content={"error": f"Unsupported file extension: {req_ext}"})
             sha256 = compute_sha256(temp_path)
             doc_id = generate_doc_id()
 
@@ -444,7 +487,10 @@ def hook_docassemble(payload: DocassembleHook, request: Request):
                     data = base64.b64decode(payload.file_base64, validate=True)
                 except Exception:
                     raise HTTPException(status_code=400, detail="Invalid base64")
-                if len(data) > 25 * 1024 * 1024:
+                # size limit with audio consideration
+                is_audio = _is_audio(payload.title, None)
+                limit = UPLOAD_MAX_BYTES_AUDIO if is_audio else UPLOAD_MAX_BYTES_DEFAULT
+                if len(data) > limit:
                     raise HTTPException(status_code=413, detail="File too large")
                 tf.write(data)
             else:
@@ -454,7 +500,9 @@ def hook_docassemble(payload: DocassembleHook, request: Request):
                     data = r.content
                 except Exception as e:
                     raise HTTPException(status_code=400, detail=f"Failed to download: {e}")
-                if len(data) > 25 * 1024 * 1024:
+                is_audio = _is_audio(payload.title, r.headers.get("Content-Type"))
+                limit = UPLOAD_MAX_BYTES_AUDIO if is_audio else UPLOAD_MAX_BYTES_DEFAULT
+                if len(data) > limit:
                     raise HTTPException(status_code=413, detail="File too large")
                 tf.write(data)
 
@@ -756,21 +804,45 @@ def sync_doc_sha(doc_id: str):
 
 # --- B4: Admin view ---
 @app.get("/admin/docs")
-def admin_docs(request: Request, limit: int = 200):
+def admin_docs(
+    request: Request,
+    limit: int = 200,  # deprecated, kept for backward compat
+    matter_id: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    per_page: int = 50,
+):
+    page = max(1, page)
+    per_page = max(1, min(200, per_page))
     with SessionLocal() as db:
-        # простая выборка последних обновлённых
-        rows = db.execute(select(Doc)).scalars().all()
-    # сортируем по updated_at desc на стороне приложения для простоты
-    try:
-        rows = sorted(rows, key=lambda r: (r.updated_at or datetime.min), reverse=True)  # type: ignore
-    except Exception:
-        pass
+        q = select(Doc)
+        if matter_id:
+            q = q.where(Doc.matter_id == matter_id)
+        if status:
+            q = q.where(Doc.status == status)
+        # order by updated_at desc (NULLS LAST) then doc_id desc
+        try:
+            q = q.order_by(desc(Doc.updated_at), desc(Doc.doc_id))
+        except Exception:
+            pass
+        offset = (page - 1) * per_page
+        q = q.offset(offset).limit(per_page)
+        rows = db.execute(q).scalars().all()
+    # pagination hints
+    has_next = len(rows) == per_page
+    has_prev = page > 1
     return templates.TemplateResponse(
         "admin/docs.html",
         {
             "request": request,
-            "docs": rows[:limit],
+            "docs": rows,
             "msg": request.query_params.get("msg", ""),
+            "filters": {"matter_id": matter_id or "", "status": status or ""},
+            "statuses": ["draft", "submitted", "triage", "registered"],
+            "page": page,
+            "per_page": per_page,
+            "has_next": has_next,
+            "has_prev": has_prev,
         },
     )
 
@@ -786,6 +858,34 @@ def admin_docs_verify(doc_id: str):
     except Exception as e:
         msg = f"Verify {doc_id}: error: {e}"
     return RedirectResponse(url=f"/admin/docs?msg={msg}", status_code=303)
+
+
+# --- C1.4: Admin status transitions ---
+@app.post("/admin/docs/{doc_id}/status")
+def admin_docs_set_status(doc_id: str, target: str = Form(...)):
+    allowed = {"draft", "submitted", "triage", "registered"}
+    if target not in allowed:
+        return RedirectResponse(url=f"/admin/docs?msg=Unknown+status", status_code=303)
+    msg = ""
+    try:
+        with SessionLocal() as db:
+            row = db.get(Doc, doc_id)
+            if not row:
+                return RedirectResponse(url=f"/admin/docs?msg=Not+found", status_code=303)
+            row.status = target
+            row.updated_at = datetime.utcnow()
+            db.add(row)
+            db.commit()
+        msg = f"Status {doc_id} → {target}"
+    except Exception as e:
+        msg = f"Status {doc_id} error: {e}"
+    return RedirectResponse(url=f"/admin/docs?msg={msg}", status_code=303)
+
+
+# --- C1: Intake UI (basic form) ---
+@app.get("/intake")
+def intake_form(request: Request):
+    return templates.TemplateResponse("intake/form.html", {"request": request})
 
 
 @app.post("/admin/docs/{doc_id}/sync_sha")

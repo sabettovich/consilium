@@ -362,8 +362,57 @@ curl -s -X POST http://localhost:8003/api/hooks/docassemble \
 ```bash
 DOC_ID=<из ответа>
 curl -s "http://localhost:8003/api/docs/${DOC_ID}" -H "X-Client-Token: ${CLIENT_READ_TOKEN}" | jq '.doc_id,.title,.origin'
-curl -i "http://localhost:8003/doc/${DOC_ID}" -H "X-Client-Token: ${CLIENT_READ_TOKEN}" | sed -n '1,5p'
 ```
-- **Ожидаемо**: `origin = "docassemble"`, редирект 3xx на Google Drive.
 
-> Примечание: если `DOCASSEMBLE_HOOK_TOKEN` не задан, заголовок не требуется (использовать только в защищённой среде).
+---
+
+## Лаба 13. Intake статус‑флоу (C1)
+
+- **Смысл**: пройти путь документа, загруженного через `/intake`, через статусы `draft → submitted → triage → registered`, сопровождать ход заметками/сообщениями.
+- **Что есть**: форма `/intake` ставит `status=draft`; статусы меняются через `PATCH /api/docs/{DOC_ID}`; фильтры статуса в админке.
+
+### Шаг 1. Загрузка через форму (draft)
+```bash
+open http://localhost:8003/intake
+```
+После загрузки получите `DOC_ID` (см. админку или API) и увидите статус `draft`.
+
+Проверка:
+```bash
+DOC_ID=<из ответа/админки>
+curl -s "http://localhost:8003/api/docs/${DOC_ID}" -H "X-Client-Token: ${CLIENT_READ_TOKEN}" | jq '.doc_id,.status,.title'
+```
+
+### Шаг 2. Отправка на разбор (submitted)
+```bash
+curl -s -X PATCH "http://localhost:8003/api/docs/${DOC_ID}" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"submitted","origin_meta":{"note":"Готово к приёмке"}}' | jq .
+```
+
+### Шаг 3. Взять в triage (triage) и добавить теги
+```bash
+curl -s -X PATCH "http://localhost:8003/api/docs/${DOC_ID}" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"triage","origin_meta":{"note":"Проверяем комплектность и класс"}}' | jq .
+curl -s -X PATCH "http://localhost:8003/api/docs/${DOC_ID}" \
+  -H "Content-Type: application/json" \
+  -d '{"tags":["intake","priority:normal"]}' | jq .
+```
+
+### Шаг 4. Принять в работу (registered) и проверить
+```bash
+curl -s -X PATCH "http://localhost:8003/api/docs/${DOC_ID}" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"registered","origin_meta":{"note":"Принято, включаем в отчёты и проверки"}}' | jq .
+curl -i "http://localhost:8003/doc/${DOC_ID}" | sed -n '1,5p'
+curl -s -X POST "http://localhost:8003/api/docs/${DOC_ID}/verify" | jq .
+```
+
+### Замечания и сообщения команде
+- Заметки храните в `origin_meta.note`.
+- Уведомления: из коробки на `doc_registered` и `deliver`. Для стадий intake можно расширить Notifier.
+
+### Админка
+- Фильтр по статусам: `http://localhost:8003/admin/docs?status=draft` и т.п.
+- Пагинация: `page`, `per_page`.
